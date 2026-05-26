@@ -1,1 +1,268 @@
 
+import cv2
+import numpy as np
+from pathlib import Path
+from sklearn.cluster import DBSCAN
+
+
+# ─────────────────────────────────────────────────────────
+# 1. TIỀN XỬ LÝ
+# ─────────────────────────────────────────────────────────
+
+def preprocess_image(img: np.ndarray) -> np.ndarray:
+
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+
+    # --- Tự động chọn hướng threshold ---
+    # Nếu mean > 127 → nền sáng → dùng THRESH_BINARY_INV (chữ đen)
+    # Nếu mean ≤ 127 → nền tối  → dùng THRESH_BINARY     (chữ sáng)
+    is_light_bg = gray.mean() > 127
+    thresh_type = cv2.THRESH_BINARY_INV if is_light_bg else cv2.THRESH_BINARY
+
+    # CLAHE: chuẩn hoá contrast
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    gray = clahe.apply(gray)
+
+    # blockSize phải lẻ và < chiều cao ảnh
+    h_img = img.shape[0]
+    block = min(31, h_img - 1 if h_img % 2 == 0 else h_img - 2)
+    block = max(block, 11)  # tối thiểu 11
+    if block % 2 == 0:
+        block -= 1
+
+    binary = cv2.adaptiveThreshold(
+        gray, 255,
+        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+        thresh_type,
+        blockSize=block,
+        C=8,
+    )
+
+    # Khử noise hạt nhỏ
+    binary = cv2.medianBlur(binary, 3)
+
+    # Dilation dọc nhẹ: nối dấu thanh tiếng Việt vào thân chữ
+    v_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, 2))
+    binary = cv2.dilate(binary, v_kernel, iterations=1)
+
+    return binary
+
+
+# ─────────────────────────────────────────────────────────
+# 2. TRÍCH XUẤT CONNECTED COMPONENTS
+# ─────────────────────────────────────────────────────────
+
+def extract_components(
+    binary_img: np.ndarray,
+    min_w: int   = 3,
+    min_h: int   = 4,
+    min_area: int = 20,
+    max_aspect: float = 12.0,
+) -> tuple[np.ndarray, list[tuple]]:
+
+    contours, _ = cv2.findContours(
+        binary_img, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+    )
+
+    centers: list[list[int]] = []
+    boxes: list[tuple] = []
+
+    for cnt in contours:
+        x, y, w, h = cv2.boundingRect(cnt)
+        area = cv2.contourArea(cnt)   # diện tích thực, không tính pixel trắng bên trong
+
+        if w < min_w or h < min_h:
+            continue
+        if area < min_area:
+            continue
+        if w / h > max_aspect:        # loại đường kẻ ngang dài
+            continue
+
+        centers.append([x + w // 2, y + h // 2])
+        boxes.append((x, y, w, h))
+
+    return np.array(centers, dtype=float), boxes
+
+
+# ─────────────────────────────────────────────────────────
+# 3. TÍNH EPS THÍCH NGHI DỰA TRÊN GAP
+# ─────────────────────────────────────────────────────────
+
+def adaptive_eps(boxes: list[tuple], fallback: float = 20.0) -> float:
+
+    if len(boxes) < 2:
+        return fallback
+
+    sorted_boxes = sorted(boxes, key=lambda b: b[0])
+    gaps = []
+    for i in range(len(sorted_boxes) - 1):
+        x_right_i = sorted_boxes[i][0] + sorted_boxes[i][2]
+        x_left_next = sorted_boxes[i + 1][0]
+        gap = x_left_next - x_right_i
+        if gap > 0:
+            gaps.append(gap)
+
+    if not gaps:
+        # fallback: dùng median width
+        widths = [b[2] for b in boxes]
+        return float(np.median(widths)) * 1.2
+
+    # p75: ngưỡng nằm giữa intra-word gap và inter-word gap
+    return float(np.percentile(gaps, 75))
+
+
+# ─────────────────────────────────────────────────────────
+# 4. DBSCAN PHÂN CỤM TỪ
+# ─────────────────────────────────────────────────────────
+
+def cluster_words(
+    centers: np.ndarray,
+    boxes: list[tuple],
+    img_height: int,
+) -> np.ndarray:
+
+    if len(centers) == 0:
+        return np.array([])
+
+    eps = adaptive_eps(boxes)
+
+    # Ước tính số dòng
+    median_h = float(np.median([b[3] for b in boxes]))
+    scale_y = 0.1 if img_height < median_h * 3 else 0.3
+
+    scaled = centers.copy()
+    scaled[:, 1] *= scale_y
+
+    labels = DBSCAN(eps=eps, min_samples=1).fit(scaled).labels_
+    return labels
+
+
+# ─────────────────────────────────────────────────────────
+# 5. SẮP XẾP VÀ LƯU
+# ─────────────────────────────────────────────────────────
+
+def sort_words_reading_order(
+    word_bboxes: list[tuple[int, int, int, int]],
+) -> list[int]:
+
+    if not word_bboxes:
+        return []
+
+    median_h = float(np.median([b[3] for b in word_bboxes]))
+    bucket_h = max(median_h * 0.6, 8)
+
+    def line_bucket(bbox):
+        return int((bbox[1] + bbox[3] / 2) // bucket_h)
+
+    indexed = sorted(
+        enumerate(word_bboxes),
+        key=lambda item: (line_bucket(item[1]), item[1][0]),
+    )
+    return [i for i, _ in indexed]
+
+
+def save_words(
+    binary_img: np.ndarray,
+    labels: np.ndarray,
+    boxes: list[tuple],
+    output_folder: Path,
+    img_stem: str,
+    pad: int = 5,
+) -> int:
+
+    unique_labels = [l for l in sorted(set(labels)) if l != -1]
+    if not unique_labels:
+        return 0
+
+    word_bboxes: list[tuple[int, int, int, int]] = []
+    for label in unique_labels:
+        indices = np.where(labels == label)[0]
+        cluster_boxes = [boxes[i] for i in indices]
+
+        x_min = min(b[0] for b in cluster_boxes)
+        y_min = min(b[1] for b in cluster_boxes)
+        x_max = max(b[0] + b[2] for b in cluster_boxes)
+        y_max = max(b[1] + b[3] for b in cluster_boxes)
+        word_bboxes.append((x_min, y_min, x_max - x_min, y_max - y_min))
+
+    sorted_order = sort_words_reading_order(word_bboxes)
+    H, W = binary_img.shape[:2]
+
+    for seq_idx, orig_idx in enumerate(sorted_order):
+        x, y, w, h = word_bboxes[orig_idx]
+        x1 = max(x - pad, 0)
+        y1 = max(y - pad, 0)
+        x2 = min(x + w + pad, W)
+        y2 = min(y + h + pad, H)
+
+        crop = binary_img[y1:y2, x1:x2]
+        crop = cv2.bitwise_not(crop)  # chữ đen, nền trắng
+
+        save_path = output_folder / f"{img_stem}_word_{seq_idx:03d}.png"
+        cv2.imwrite(str(save_path), crop)
+
+    return len(sorted_order)
+
+
+# ─────────────────────────────────────────────────────────
+# 6. HÀM CHÍNH
+# ─────────────────────────────────────────────────────────
+
+def segment_words_vietnamese_ocr(
+    input_folder: str | Path,
+    output_folder: str | Path,
+) -> None:
+    input_folder = Path(input_folder)
+    output_folder = Path(output_folder)
+    output_folder.mkdir(parents=True, exist_ok=True)
+
+    image_extensions = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff"}
+    img_paths = sorted(
+        p for p in input_folder.iterdir()
+        if p.suffix.lower() in image_extensions
+    )
+
+    if not img_paths:
+        print("Không tìm thấy ảnh trong thư mục đầu vào.")
+        return
+
+    print(f"Tìm thấy {len(img_paths)} ảnh.\n")
+    total_words = 0
+
+    for img_path in img_paths:
+        print(f"Đang xử lý: {img_path.name}")
+        img = cv2.imread(str(img_path))
+        if img is None:
+            print("  ✗ Không đọc được ảnh, bỏ qua.\n")
+            continue
+
+        binary = preprocess_image(img)
+        centers, boxes = extract_components(binary)
+
+        if len(centers) == 0:
+            print("  ✗ Không phát hiện văn bản.\n")
+            continue
+
+        labels = cluster_words(centers, boxes, img_height=img.shape[0])
+
+        img_output_folder = output_folder / img_path.stem
+        img_output_folder.mkdir(exist_ok=True)
+
+        count = save_words(binary, labels, boxes, img_output_folder, img_path.stem)
+        total_words += count
+
+        eps_used = adaptive_eps(boxes)
+        print(f"  ✓ Tách được {count} từ  (eps thích nghi = {eps_used:.1f}px)\n")
+
+    print(f"[XONG] Tổng số từ đã tách: {total_words}")
+
+
+# ─────────────────────────────────────────────────────────
+# CHẠY
+# ─────────────────────────────────────────────────────────
+
+if __name__ == "__main__":
+    segment_words_vietnamese_ocr(
+        input_folder="my_test_dataset",
+        output_folder="segmented_words_output",
+    )
